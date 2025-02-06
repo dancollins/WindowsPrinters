@@ -12,10 +12,24 @@ struct page_details
     char name[64];
 };
 
-void draw(HDC canvas)
+struct coordinate_space
 {
-    Rectangle(canvas, 10, 10, 100, 100);
-}
+    struct
+    {
+        int width;
+        int height;
+        int offset_x;
+        int offset_y;
+    } logical;
+
+    struct
+    {
+        int width;
+        int height;
+        int offset_x;
+        int offset_y;
+    } device;
+};
 
 struct page_details *get_page_details(const char *printer_name, const char *page_name)
 {
@@ -116,21 +130,168 @@ exit:
     return details;
 }
 
+void draw(HDC canvas)
+{
+    Rectangle(canvas, 100, 100, 1100, 1100);
+}
+
+int set_page_size(
+    const char *printer_name,
+    const struct page_details *details,
+    DEVMODE **devmode)
+{
+    int rc = 0;
+    HANDLE printer = NULL;
+    int devmode_size = 0;
+
+    *devmode = NULL;
+
+    printf(
+        "Setting page size on \"%s\" to: \"%s\"\n",
+        printer_name,
+        details->name);
+
+    if (OpenPrinter((char *)printer_name, &printer, NULL) == 0)
+    {
+        fprintf(stderr, "Failed to open printer\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    devmode_size = DocumentProperties(
+        NULL, printer, (char *)printer_name, NULL, NULL, 0);
+
+    if (devmode_size <= 0)
+    {
+        fprintf(stderr, "Failed to get printer properties size\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    *devmode = (DEVMODE *)malloc(devmode_size);
+    if (*devmode == NULL)
+    {
+        fprintf(stderr, "Failed to allocate %u octets\n", devmode_size);
+        rc = -ENOMEM;
+        goto exit;
+    }
+
+    if (DocumentProperties(
+            NULL,
+            printer,
+            (char *)printer_name,
+            *devmode,
+            NULL,
+            DM_OUT_BUFFER) != IDOK)
+    {
+        fprintf(stderr, "Failed to get printer properties\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    (*devmode)->dmPaperSize = details->size;
+
+    if (DocumentProperties(
+            NULL,
+            printer,
+            (char *)printer_name,
+            *devmode,
+            *devmode,
+            DM_IN_BUFFER | DM_OUT_BUFFER) != IDOK)
+    {
+        fprintf(stderr, "Failed to set printer properties\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (ClosePrinter(printer) == 0)
+    {
+        fprintf(stderr, "Failed to close printer\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    return 0;
+
+exit:
+    if (printer != NULL)
+        ClosePrinter(printer);
+
+    if (*devmode == NULL)
+        free(*devmode);
+
+    return rc;
+}
+
+int print_emf(
+    HDC printer,
+    HENHMETAFILE emf,
+    const char *file_name,
+    const struct coordinate_space *space)
+{
+    DOCINFO doc_info = {0};
+    RECT rect;
+
+    printf("Sending %s to printer\n", file_name);
+
+    /* We need to crop to just the printable area when rendering
+     * this to the printer. */
+    rect.left = space->logical.offset_x;
+    rect.top = space->logical.offset_y;
+    rect.right = space->logical.width - (2 * space->logical.offset_x);
+    rect.bottom = space->logical.height - (2 * space->logical.offset_y);
+
+    doc_info.cbSize = sizeof(doc_info);
+    doc_info.lpszDocName = file_name;
+
+    if (StartDoc(printer, &doc_info) <= 0)
+    {
+        fprintf(stderr, "Failed to start document\n");
+        return -EINVAL;
+    }
+
+    if (StartPage(printer) <= 0)
+    {
+        fprintf(stderr, "Failed to start page\n");
+        EndDoc(printer);
+        return -EINVAL;
+    }
+
+    if (PlayEnhMetaFile(printer, emf, &rect) == 0)
+    {
+        fprintf(stderr, "Failed to play metafile\n");
+    }
+
+    if (EndPage(printer) <= 0)
+    {
+        fprintf(stderr, "Failed to end page\n");
+        EndDoc(printer);
+        return -EINVAL;
+    }
+
+    if (EndDoc(printer) <= 0)
+    {
+        fprintf(stderr, "Failed to end document\n");
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
 int demo_print(const char *printer_name, const char *page_size)
 {
     int rc;
     struct page_details *details = NULL;
-    HDC canvas = NULL;
-    int xres, yres;
-    int logicalx, logicaly;
-    HANDLE hPrinter = NULL;
+    DEVMODE *devmode = NULL;
+    struct coordinate_space space;
     HDC printer = NULL;
-    int devmode_size = 0;
-    DEVMODEA *devmode;
+    HDC canvas = NULL;
     HENHMETAFILE emf = NULL;
-    DOCINFOA doc_info;
-    RECT rect;
 
+    /* Configure the printer - for now all we're doing is setting the
+     * page size. We have to do this first, because we then ask the printer
+     * to tell us, based on this page size, how many pixels it has in X
+     * and Y. */
     details = get_page_details(printer_name, page_size);
     if (details == NULL)
     {
@@ -139,6 +300,59 @@ int demo_print(const char *printer_name, const char *page_size)
         goto exit;
     }
 
+    rc = set_page_size(printer_name, details, &devmode);
+    if (rc < 0)
+    {
+        fprintf(stderr, "Failed to set page size\n");
+        goto exit;
+    }
+
+    printer = CreateDC("WINSPOOL", printer_name, NULL, devmode);
+    if (printer == NULL)
+    {
+        fprintf(stderr, "Failed to create printer\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    /* Our drawing is done in logical units and, for convenience, we'll use
+     * 1/10 mm units (as returned by DC_PAPERSIZE) and represent the entire
+     * page. */
+    space.logical.width = details->dimensions.x;
+    space.logical.height = details->dimensions.y;
+
+    /* The printer coordinate space uses pixels, at some DPI. Our EMF
+     * represents an entire page - but we also need to account for the
+     * actual printable area. We handle this by capturing the offsets. */
+    space.device.width = GetDeviceCaps(printer, PHYSICALWIDTH);
+    space.device.height = GetDeviceCaps(printer, PHYSICALHEIGHT);
+    space.device.offset_x = GetDeviceCaps(printer, PHYSICALOFFSETX);
+    space.device.offset_y = GetDeviceCaps(printer, PHYSICALOFFSETY);
+
+    /* We also need to calculate the offsets for our logical page. */
+    double scale_x = (double)space.logical.width / (double)space.device.width;
+    double scale_y = (double)space.logical.height / (double)space.device.height;
+
+    space.logical.offset_x = (int)(space.device.offset_x * scale_x);
+    space.logical.offset_y = (int)(space.device.offset_y * scale_y);
+
+    printf("Coordinate space:\n");
+
+    printf(
+        "  Logical: %d x %d, offset (%d, %d)\n",
+        space.logical.width,
+        space.logical.height,
+        space.logical.offset_x,
+        space.logical.offset_y);
+
+    printf(
+        "  Device: %d x %d, offset (%d, %d)\n",
+        space.device.width,
+        space.device.height,
+        space.device.offset_x,
+        space.device.offset_y);
+
+    /* Prepare the EMF for drawing on. */
     canvas = CreateEnhMetaFile(NULL, NULL, NULL, NULL);
     if (canvas == NULL)
     {
@@ -147,43 +361,33 @@ int demo_print(const char *printer_name, const char *page_size)
         goto exit;
     }
 
-    /* TODO: This is copied from ChatGPT and isn't working. I suspect the
-     * coordinate system is wrong here, or on the printer down below. Not
-     * sure why we need two coordinate spaces like this! */
-
-    xres = GetDeviceCaps(canvas, LOGPIXELSX);
-    yres = GetDeviceCaps(canvas, LOGPIXELSY);
-    if (xres <= 0 || yres <= 0)
-    {
-        fprintf(stderr, "Failed to get DPI\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    if (SetMapMode(canvas, MM_ANISOTROPIC) == 0)
+    if (SetMapMode(canvas, MM_ISOTROPIC) == 0)
     {
         fprintf(stderr, "Failed to set map mode\n");
         rc = -EINVAL;
         goto exit;
     }
 
-    if (SetWindowExtEx(canvas, details->dimensions.x / 10, details->dimensions.y / 10, NULL) == 0)
+    /* Logical space is the entire page - we use the offset while drawing. */
+    if (SetWindowExtEx(
+            canvas, space.logical.width, space.logical.height, NULL) == 0)
     {
         fprintf(stderr, "Failed to set window extents\n");
         rc = -EINVAL;
         goto exit;
     }
 
-    logicalx = xres * details->dimensions.x / 10 / 25.4;
-    logicaly = yres * details->dimensions.y / 10 / 25.4;
-
-    if (SetViewportExtEx(canvas, xres, yres, NULL) == 0)
+    /* Physical space is the actual printable area - and we've already
+     * accounted for the offsets. */
+    if (SetViewportExtEx(
+            canvas, space.device.width, space.device.height, NULL) == 0)
     {
         fprintf(stderr, "Failed to set viewport extents\n");
         rc = -EINVAL;
         goto exit;
     }
 
+    /* Actually draw out what we want to draw! */
     draw(canvas);
 
     emf = CloseEnhMetaFile(canvas);
@@ -194,102 +398,11 @@ int demo_print(const char *printer_name, const char *page_size)
         goto exit;
     }
 
-    if (OpenPrinter((char *)printer_name, &hPrinter, NULL) == 0)
+    /* Send the EMF to the printer. */
+    rc = print_emf(printer, emf, "Demo Print", &space);
+    if (rc < 0)
     {
-        fprintf(stderr, "Failed to open printer\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    devmode_size = DocumentProperties(NULL, hPrinter, (char *)printer_name, NULL, NULL, 0);
-    if (devmode_size <= 0)
-    {
-        fprintf(stderr, "Failed to get printer properties size\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    devmode = (DEVMODEA *)malloc(devmode_size);
-    if (devmode == NULL)
-    {
-        fprintf(stderr, "Failed to allocate %u octets\n", devmode_size);
-        rc = -ENOMEM;
-        goto exit;
-    }
-
-    if (DocumentProperties(NULL, hPrinter, (char *)printer_name, devmode, NULL, DM_OUT_BUFFER) != IDOK)
-    {
-        fprintf(stderr, "Failed to get printer properties\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    devmode->dmPaperSize = details->size;
-
-    if (DocumentProperties(NULL, hPrinter, (char *)printer_name, devmode, devmode, DM_IN_BUFFER | DM_OUT_BUFFER) != IDOK)
-    {
-        fprintf(stderr, "Failed to set printer properties\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    printer = CreateDC("WINSPOOL", printer_name, NULL, devmode);
-    if (printer == NULL)
-    {
-        fprintf(stderr, "Failed to create printer with devmode\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    printer = ResetDC(printer, devmode);
-    if (printer == NULL)
-    {
-        fprintf(stderr, "Failed to reset printer\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    memset(&doc_info, 0, sizeof(doc_info));
-    doc_info.cbSize = sizeof(doc_info);
-    doc_info.lpszDocName = "Demo Print";
-
-    if (StartDocA(printer, &doc_info) <= 0)
-    {
-        fprintf(stderr, "Failed to start document\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    if (StartPage(printer) <= 0)
-    {
-        fprintf(stderr, "Failed to start page\n");
-        EndDoc(printer);
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    rect.left = 0;
-    rect.top = 0;
-    rect.right = GetDeviceCaps(printer, HORZRES);
-    rect.bottom = GetDeviceCaps(printer, VERTRES);
-
-    if (PlayEnhMetaFile(printer, emf, &rect) == 0)
-    {
-        fprintf(stderr, "Failed to play metafile\n");
-        rc = -EINVAL;
-    }
-
-    if (EndPage(printer) <= 0)
-    {
-        fprintf(stderr, "Failed to end page\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    if (EndDoc(printer) <= 0)
-    {
-        fprintf(stderr, "Failed to end document\n");
-        rc = -EINVAL;
+        fprintf(stderr, "Failed to print metafile\n");
         goto exit;
     }
 
@@ -299,14 +412,11 @@ exit:
     if (details != NULL)
         free(details);
 
-    if (emf != NULL)
-        DeleteEnhMetaFile(emf);
-
-    if (hPrinter != NULL)
-        ClosePrinter(hPrinter);
-
     if (printer != NULL)
         DeleteDC(printer);
+
+    if (emf != NULL)
+        DeleteEnhMetaFile(emf);
 
     return rc;
 }
