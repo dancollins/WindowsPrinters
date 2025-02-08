@@ -4,7 +4,6 @@
 #include "stdio.h"
 
 static const char *A4_PAGE_NAME = "A4";
-static const char *EMF_FILE_NAME = "demo_print.emf";
 
 struct page_details
 {
@@ -231,6 +230,193 @@ void draw(HDC printer, const struct coordinate_space *space)
     printf("  Rectangle (pixels) (%d,%d),(%d,%d)\n", p[0].x, p[0].y, p[1].x, p[1].y);
 }
 
+HENHMETAFILE draw_document(int width_mm_10, int height_mm_10)
+{
+    const char *EMF_FILE_NAME = "OUTPUT.emf";
+
+    HENHMETAFILE emf = NULL;
+    HDC canvas = NULL;
+
+    /* We want to keep this document with consistent units! */
+    const struct coordinate_space space = {
+        .logical.width = width_mm_10,
+        .logical.height = height_mm_10,
+        .device.width = width_mm_10,
+        .device.height = height_mm_10,
+    };
+
+    canvas = CreateEnhMetaFile(NULL, EMF_FILE_NAME, NULL, NULL);
+    if (canvas == NULL)
+    {
+        printf("Failed to create canvas\n");
+        goto exit;
+    }
+
+    if (SetMapMode(canvas, MM_ISOTROPIC) == 0)
+    {
+        printf("Failed to set map mode\n");
+        goto exit;
+    }
+
+    if (SetWindowExtEx(
+            canvas, space.logical.width, space.logical.height, NULL) == 0)
+    {
+        printf("Failed to set window extents\n");
+        goto exit;
+    }
+
+    if (SetViewportExtEx(
+            canvas, space.device.width, space.device.height, NULL) == 0)
+    {
+        printf("Failed to set viewport extents\n");
+        goto exit;
+    }
+
+    /* Draw the document. */
+    draw(canvas, &space);
+
+    emf = CloseEnhMetaFile(canvas);
+    if (emf == NULL)
+    {
+        printf("Failed to close metafile\n");
+    }
+
+exit:
+    if (canvas != NULL)
+        DeleteDC(canvas);
+
+    return emf;
+}
+
+int direct_print(HDC printer, const struct coordinate_space *space)
+{
+    int rc = 0;
+
+    if (SaveDC(printer) == 0)
+    {
+        printf("Failed to save DC\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    /* We want to ensure symmetric scaling. */
+    if (SetMapMode(printer, MM_ISOTROPIC) == 0)
+    {
+        printf("Failed to set map mode\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    /* Set up logical and device coordinate systems. */
+    if (SetWindowExtEx(printer, space->logical.width, space->logical.height, NULL) == 0)
+    {
+        printf("Failed to set window extents\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (SetViewportExtEx(printer, space->device.width, space->device.height, NULL) == 0)
+    {
+        printf("Failed to set viewport extents\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (SetViewportOrgEx(printer, 0, 0, NULL) == 0)
+    {
+        printf("Failed to set viewport origin\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    /* Draw what we want to print. */
+    draw(printer, space);
+
+    if (RestoreDC(printer, -1) == 0)
+    {
+        printf("Failed to restore DC\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+exit:
+    return rc;
+}
+
+int print_emf(HDC printer, HENHMETAFILE emf, const struct coordinate_space *space)
+{
+    int rc = 0;
+    ENHMETAHEADER header = {0};
+
+    if (GetEnhMetaFileHeader(emf, sizeof(header), &header) == 0)
+    {
+        printf("Failed to get metafile header\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (SaveDC(printer) == 0)
+    {
+        printf("Failed to save DC\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (SetMapMode(printer, MM_ISOTROPIC) == 0)
+    {
+        printf("Failed to set map mode\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (SetWindowExtEx(
+            printer, space->logical.width, space->logical.height, NULL) == 0)
+    {
+        printf("Failed to set window extents\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (SetViewportExtEx(
+            printer, space->device.width, space->device.height, NULL) == 0)
+    {
+        printf("Failed to set viewport extents\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    RECT bounds = {
+        .left = header.rclBounds.left,
+        .top = header.rclBounds.top,
+        .right = header.rclBounds.right,
+        .bottom = header.rclBounds.bottom,
+    };
+
+    printf(
+        "EMF bounds: (%d,%d),(%d,%d)\n",
+        bounds.left,
+        bounds.top,
+        bounds.right,
+        bounds.bottom);
+
+    if (PlayEnhMetaFile(printer, emf, &bounds) == 0)
+    {
+        printf("Failed to play metafile\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+    if (RestoreDC(printer, -1) == 0)
+    {
+        printf("Failed to restore DC\n");
+        rc = -EINVAL;
+        goto exit;
+    }
+
+exit:
+    return rc;
+}
+
 int demo_print(const char *printer_name, const char *page_size)
 {
     int rc;
@@ -336,50 +522,24 @@ int demo_print(const char *printer_name, const char *page_size)
         goto exit;
     }
 
-    if (SaveDC(printer) == 0)
+    // rc = direct_print(printer, &space);
+    // if (rc < 0)
+    // {
+    //     printf("Failed to print directly\n");
+    // }
+
+    HENHMETAFILE emf = draw_document(space.logical.width, space.logical.height);
+    if (emf == NULL)
     {
-        printf("Failed to save DC\n");
+        printf("Failed to draw document\n");
         rc = -EINVAL;
         goto exit;
     }
 
-    /* We want to ensure symmetric scaling. */
-    if (SetMapMode(printer, MM_ISOTROPIC) == 0)
+    rc = print_emf(printer, emf, &space);
+    if (rc < 0)
     {
-        printf("Failed to set map mode\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    /* Set up logical and device coordinate systems. */
-    if (SetWindowExtEx(printer, space.logical.width, space.logical.height, NULL) == 0)
-    {
-        printf("Failed to set window extents\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    if (SetViewportExtEx(printer, space.device.width, space.device.height, NULL) == 0)
-    {
-        printf("Failed to set viewport extents\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    if (SetViewportOrgEx(printer, 0, 0, NULL) == 0)
-    {
-        printf("Failed to set viewport origin\n");
-        rc = -EINVAL;
-        goto exit;
-    }
-
-    /* Draw what we want to print. */
-    draw(printer, &space);
-
-    if (RestoreDC(printer, -1) == 0)
-    {
-        printf("Failed to restore DC\n");
-        rc = -EINVAL;
+        printf("Failed to print EMF\n");
         goto exit;
     }
 
